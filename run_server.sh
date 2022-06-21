@@ -7,8 +7,8 @@ source $DIR/.env
 PARAM=$1
 
 if [ "$PARAM" == "chat_id" ]; then
-  python $DIR/lib/get_chat_id.py
+  python3 $DIR/lib/get_chat_id.py
   exit
 fi
 
-python $DIR/lib/server.py
+python3 $DIR/lib/server.py
