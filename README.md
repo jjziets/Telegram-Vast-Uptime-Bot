@@ -4,7 +4,7 @@ This is a set of scripts for monitoring machine crashes. Run the client on your 
 
 I recommend a $2.50 or $3.50 server from Vultr. Server location must be set to New Jersey for the cheap plans. Use my referral link for $100 credit.
 https://www.vultr.com/?ref=8581277-6G
-
+*based on leona / vast.ai-tools
 ## Setup Telegram bot
 
 1. Search for the contact BotFather in app
