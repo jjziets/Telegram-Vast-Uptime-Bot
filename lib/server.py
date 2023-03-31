@@ -14,19 +14,22 @@ def missed_ping(worker):
 
     del timers[worker]
     print("Missed ping for", worker)
-    response = telegram_request("/sendMessage?chat_id=" + os.getenv("CHAT_ID") + "&text=" + worker + " is down")
+    
+    while True:
+        response = telegram_request("/sendMessage?chat_id=" + os.getenv("CHAT_ID") + "&text=" + worker + " is down")
+        if response.get('error_code') == 429:
+            retry_after = response.get('parameters', {}).get('retry_after', 0) + 1
+            print(f"Pausing all timers for {retry_after}s...")
+            
+            for w, e in pause_events.items():
+                e.clear()
 
-    if response.get('error_code') == 429:
-        retry_after = response.get('parameters', {}).get('retry_after', 0) + 1
-        print(f"Pausing all timers for {retry_after}s...")
-        
-        for w, e in pause_events.items():
-            e.clear()
+            time.sleep(retry_after)
 
-        time.sleep(retry_after)
-
-        for w, e in pause_events.items():
-            e.set()
+            for w, e in pause_events.items():
+                e.set()
+        else:
+            break
 
 @app.route('/ping/<worker_id>', methods=['GET'])
 def app_stats(worker_id):
@@ -57,4 +60,4 @@ def app_stats(worker_id):
     })
 
 if __name__ == '__main__':
-	app.run(host="0.0.0.0", port=os.getenv("SERVER_PORT"))
+    app.run(host="0.0.0.0", port=os.getenv("SERVER_PORT"))
