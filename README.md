@@ -30,6 +30,7 @@ If you get too many false notifications, try increase the FAIL_TIMEOUT.
 
 Install dependencies
 ```bash
+apt install pathon3 python3-pip
 pip install -r requirements.txt
 ```
 
@@ -41,6 +42,7 @@ After adding your telegram_token to your .env file and sending /start to your bo
 
 ### Run server
 ```bash
+chmod +x run_server.sh
 ./run_server.sh
 ```
 
