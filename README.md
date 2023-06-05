@@ -30,7 +30,7 @@ If you get too many false notifications, try increase the FAIL_TIMEOUT.
 
 Install dependencies
 ```bash
-apt install pathon3 python3-pip
+apt install python3 python3-pip
 pip install -r requirements.txt
 ```
 
