@@ -39,6 +39,11 @@ After adding your telegram_token to your .env file and sending /start to your bo
 ```bash
 ./run_server.sh chat_id
 ```
+or for groups and channles: 
+Log in with your account to Telegram web and select the Telegram group. Then, in the URL of your web browser you should see something similar to https://web.telegram.org/k/#-XXXXXXXXX. Then, the ID you need to use for the Telegram group is -XXXXXXXXX, where each X character represents a number. Remember to include the minus symbol preceding the numbers.
+
+Finally, for private channels in Telegram, select the private channel in Telegram web. Then, in the URL of your web browser you should see something similar to https://web.telegram.org/k/#-YYYYYYYYYY. Here, the ID you need to use for the private channel is -100YYYYYYYYYY. That is, you need to include a 100 between the minus symbol and the YYYYYYYYYY numbers.
+you will need to addd your bot to the group or channel 
 
 ### Run server
 ```bash
