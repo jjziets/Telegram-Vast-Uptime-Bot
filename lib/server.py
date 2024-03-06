@@ -63,7 +63,7 @@ def app_stats(worker_id):
 @app.route('/')
 def index():
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    active_workers = list(timers.keys())  # Assumes timers contains worker_ids that are up
+    active_workers = sorted(list(timers.keys()))  # Assumes timers contains worker_ids that are up
     return render_template('index.html', current_time=current_time, active_workers=active_workers)
 
 if __name__ == '__main__':
