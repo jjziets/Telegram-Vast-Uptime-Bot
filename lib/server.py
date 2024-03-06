@@ -1,4 +1,6 @@
 from flask import jsonify, request, Flask, render_template
+from queue import Queue
+import threading  # Import the threading module
 from threading import Timer, Event
 import os,  time
 from datetime import datetime
@@ -7,6 +9,29 @@ app = Flask(__name__)
 
 timers = {}
 pause_events = {}
+# Create a message queue
+message_queue = Queue()
+
+def message_sender():
+    while True:
+        # Retrieve the next message from the queue
+        message = message_queue.get()
+        try:
+            # Attempt to send the message
+            while True:
+                response = telegram_request("/sendMessage?chat_id=" + os.getenv("CHAT_ID") + "&text=" + message)
+                if response.get('error_code') == 429:
+                    # If rate limited, wait and retry
+                    retry_after = response.get('parameters', {}).get('retry_after', 1)
+                    time.sleep(retry_after)
+                else:
+                    break
+        finally:
+            # Mark the message as processed
+            message_queue.task_done()
+
+# Start the message sender thread
+threading.Thread(target=message_sender, daemon=True).start()
 
 def missed_ping(worker):
     pause_event = pause_events.get(worker)
@@ -15,22 +40,9 @@ def missed_ping(worker):
 
     del timers[worker]
     print("Missed ping for", worker)
-    
-    while True:
-        response = telegram_request("/sendMessage?chat_id=" + os.getenv("CHAT_ID") + "&text=" + worker + " is down")
-        if response.get('error_code') == 429:
-            retry_after = response.get('parameters', {}).get('retry_after', 0) + 1
-            print(f"Pausing all timers for {retry_after}s...")
-            
-            for w, e in pause_events.items():
-                e.clear()
 
-            time.sleep(retry_after)
-
-            for w, e in pause_events.items():
-                e.set()
-        else:
-            break
+    # Queue the message instead of sending it directly
+    message_queue.put(worker + " is down")
 
 @app.route('/ping/<worker_id>', methods=['GET'])
 def app_stats(worker_id):
@@ -46,7 +58,8 @@ def app_stats(worker_id):
         print("Cancelling timer for:", worker_id)
         timers[worker_id].cancel()
     else:
-        telegram_request("/sendMessage?chat_id=" + os.getenv("CHAT_ID") + "&text=" + worker_id + " is up")
+        message = worker_id + " is up"
+        message_queue.put(message)
 
     print("Creating timer for:", worker_id)
     pause_event = Event()
