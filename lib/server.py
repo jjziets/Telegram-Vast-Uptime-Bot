@@ -1,6 +1,7 @@
-from flask import jsonify, request, Flask
+from flask import jsonify, request, Flask, render_template
 from threading import Timer, Event
-import os
+import os,  time
+from datetime import datetime
 from utilities import telegram_request
 app = Flask(__name__)
 
@@ -58,6 +59,12 @@ def app_stats(worker_id):
         "status": 1,
         "msg": "Heartbeat received"
     })
+
+@app.route('/')
+def index():
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    active_workers = list(timers.keys())  # Assumes timers contains worker_ids that are up
+    return render_template('index.html', current_time=current_time, active_workers=active_workers)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=os.getenv("SERVER_PORT"))
