@@ -22,6 +22,7 @@ https://www.vultr.com/?ref=8581277-6G
 sudo apt update && sudo apt upgrade -y
 sudo apt install git -y
 git clone https://github.com/jjziets/Telegram-Vast-Uptime-Bot.git
+cd Telegram-Vast-Uptime-Bot
 ```
 
 ### Config setup
@@ -72,10 +73,11 @@ Start on boot (optional) change path to uptime-monitor location
 
 ### Run client. Pass a name (no spaces) for your worker.
 ```bash
+chmod +x  run_client.sh
 ./run_client.sh <worker_name>
 ```
 
-Start on boot (optional) change path and <worker_name>
+Start on boot (optional), change path, and <worker_name> or leave $(hostname) if you want the machine name 
 ```bash
-(crontab -l; echo "@reboot screen -dmS uptime-client /root/uptime-monitor/run_client.sh <worker_name>") | crontab -
+(crontab -l; echo "@reboot screen -dmS uptime-server  /home/ubuntu/Telegram-Vast-Uptime-Bot/run_client.sh $(hostname) ") | crontab -
 ```
