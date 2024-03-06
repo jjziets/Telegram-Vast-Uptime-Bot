@@ -2,6 +2,11 @@
 
 This is a set of scripts for monitoring machine crashes. Run the client on your vast machine and the server on a remote one. You get notifications on Telegram if no heartbeats are sent within the timeout (default 12 seconds).
 
+it also has a simple dashboard that you can access on the same port
+
+![image](https://github.com/jjziets/Telegram-Vast-Uptime-Bot/assets/19214485/a3de851e-738c-49cd-852c-bb702e7800f2)
+
+
 I recommend a $2.50 or $3.50 server from Vultr. Server location must be set to New Jersey for the cheap plans. Use my referral link for $100 credit.
 https://www.vultr.com/?ref=8581277-6G
 *based on leona / vast.ai-tools
@@ -12,13 +17,20 @@ https://www.vultr.com/?ref=8581277-6G
 3. Enter the details and then copy the token it gives you
 4. Create a group chat with your bot and send "/start"
 
+### On the VPS ubunut 22.04 run the following
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install git -y
+git clone https://github.com/jjziets/Telegram-Vast-Uptime-Bot.git
+```
+
 ### Config setup
 Create a file called ".env" in this directory. You can copy the same .env between server and client, only some are absolutely required though.
 ```bash
 CHAT_ID=                  # SERVER only - See below for steps
 TELEGRAM_TOKEN=<token>    # SERVER - Token as given in previous step
-FAIL_TIMEOUT=5            # SERVER - If no pings in 5 seconds, send alert.
-PING_INTERVAL=2           # CLIENT - How often to send pings
+FAIL_TIMEOUT=60            # SERVER - If no pings in 5 seconds, send alert.
+PING_INTERVAL=15           # CLIENT - How often to send pings
 API_KEY=asecretkey        # SERVER+CLIENT - A random unique key to authenticate the client
 SERVER_ADDR=192.168.1.150 # SERVER+CLIENT - Address the client will use to send pings
 SERVER_PORT=5000          # SERVER+CLIENT - Port of the server.
