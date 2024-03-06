@@ -64,9 +64,9 @@ chmod +x run_server.sh
 ./run_server.sh
 ```
 
-Start on boot (optional) change path to uptime-monitor location
+Start on boot (optional) change path to uptime-monitor location. Check the path
 ```bash
-(crontab -l; echo "@reboot screen -dmS uptime-server /root/uptime-monitor/run_server.sh") | crontab -
+(crontab -l; echo "@reboot screen -dmS uptime-server /root/Telegram-Vast-Uptime-Bot/run_server.sh") | crontab -
 ```
 
 ## Client setup
