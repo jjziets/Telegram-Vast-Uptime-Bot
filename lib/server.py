@@ -58,6 +58,7 @@ def app_stats(worker_id):
     api_key = request.args.get('api_key')
 
     if api_key != os.getenv("API_KEY"):
+        print(f"Invalid API key for worker {worker_id}")  # Debugging output
         return jsonify({
             "status": 0,
             "msg": "Invalid API key"
@@ -69,10 +70,10 @@ def app_stats(worker_id):
     worker_was_not_already_tracked = worker_id not in timers
 
     if worker_id in timers:
-        print("Cancelling timer for:", worker_id)
+        print(f"Cancelling timer for: {worker_id}")  # Debugging output
         timers[worker_id].cancel()
 
-    print("Creating timer for:", worker_id)
+    print(f"Creating timer for: {worker_id}")  # Debugging output
     pause_event = Event()
     pause_event.set()
     pause_events[worker_id] = pause_event
@@ -80,8 +81,10 @@ def app_stats(worker_id):
     timers[worker_id].start()
 
     if worker_was_not_already_tracked:
-        # Queue the "up" message only if the worker wasn't already tracked
+        print(f"Worker {worker_id} was not already tracked, sending 'up' message.")  # Debugging output
         message_queue.put(worker_id + " is up")
+    else:
+        print(f"Worker {worker_id} was already tracked, not sending 'up' message.")  # Debugging output
 
     return jsonify({
         "status": 1,
