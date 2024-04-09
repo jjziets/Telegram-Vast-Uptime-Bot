@@ -66,6 +66,8 @@ def app_stats(worker_id):
     current_time = datetime.now()
     last_seen[worker_id] = current_time  # Update the last seen time
 
+    worker_was_not_already_tracked = worker_id not in timers
+
     if worker_id in timers:
         print("Cancelling timer for:", worker_id)
         timers[worker_id].cancel()
@@ -76,6 +78,10 @@ def app_stats(worker_id):
     pause_events[worker_id] = pause_event
     timers[worker_id] = Timer(int(os.getenv("FAIL_TIMEOUT")), missed_ping, [worker_id])
     timers[worker_id].start()
+
+    if worker_was_not_already_tracked:
+        # Queue the "up" message only if the worker wasn't already tracked
+        message_queue.put(worker_id + " is up")
 
     return jsonify({
         "status": 1,
