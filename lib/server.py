@@ -3,13 +3,14 @@ from queue import Queue
 import threading  # Import the threading module
 from threading import Timer, Event
 import os,  time
-from datetime import datetime
+from datetime import datetime, timedelta
 from utilities import telegram_request
 app = Flask(__name__)
 
 timers = {}
 pause_events = {}
 # Create a message queue
+last_seen = {}  # Dictionary to keep track of the last seen time for each worker
 message_queue = Queue()
 
 def message_sender():
@@ -38,11 +39,19 @@ def missed_ping(worker):
     if pause_event is not None:
         pause_event.wait()
 
-    del timers[worker]
-    print("Missed ping for", worker)
+    current_time = datetime.now()
+    last_ping = last_seen.get(worker, current_time)
+    # Only notify for missed ping if the last ping is beyond the FAIL_TIMEOUT
+    if (current_time - last_ping) > timedelta(seconds=int(os.getenv("FAIL_TIMEOUT"))):
+        print("Missed ping for", worker)
+        message_queue.put(worker + " is down")
+    else:
+        print("False alarm for", worker)
 
-    # Queue the message instead of sending it directly
-    message_queue.put(worker + " is down")
+    if worker in timers:
+        del timers[worker]
+    if worker in pause_events:
+        del pause_events[worker]
 
 @app.route('/ping/<worker_id>', methods=['GET'])
 def app_stats(worker_id):
@@ -54,12 +63,12 @@ def app_stats(worker_id):
             "msg": "Invalid API key"
         })
 
+    current_time = datetime.now()
+    last_seen[worker_id] = current_time  # Update the last seen time
+
     if worker_id in timers:
         print("Cancelling timer for:", worker_id)
         timers[worker_id].cancel()
-    else:
-        message = worker_id + " is up"
-        message_queue.put(message)
 
     print("Creating timer for:", worker_id)
     pause_event = Event()
