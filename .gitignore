@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Ansible inventory (may contain IPs)
+ansible/inventory.ini
+!ansible/inventory.example.ini
+
 # Log files
 logs/
 *.log

@@ -1,0 +1,134 @@
+---
+# Ansible playbook to deploy RCA uptime client to all brickboxes
+# Run from bbmaint (88.0.33.141):
+#   ansible-playbook -i inventory.ini deploy_rca_client.yml
+
+- name: Deploy RCA Uptime Client to BrickBoxes
+  hosts: brickboxes
+  become: yes
+  vars:
+    uptime_dir: /root/vast-uptime_monitor
+    # These should be in vault or passed via --extra-vars
+    server_addr: "159.65.255.55"
+    server_port: "5000"
+    api_key: "{{ lookup('env', 'UPTIME_API_KEY') | default('asdnasfvlknasfglknasfgknasf', true) }}"
+    ping_interval: "30"
+    fail_timeout: "30"
+
+  tasks:
+    - name: Ensure uptime directory exists
+      file:
+        path: "{{ uptime_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Ensure logs directory exists
+      file:
+        path: "{{ uptime_dir }}/logs/mtr"
+        state: directory
+        mode: '0755'
+        recurse: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - mtr
+          - curl
+          - jq
+        state: present
+        update_cache: yes
+      ignore_errors: yes
+
+    - name: Copy RCA client script
+      copy:
+        src: ../run_client_rca.sh
+        dest: "{{ uptime_dir }}/run_client_rca.sh"
+        mode: '0755'
+
+    - name: Create .env file
+      template:
+        src: env.j2
+        dest: "{{ uptime_dir }}/.env"
+        mode: '0600'
+
+    - name: Get hostname for worker name
+      command: hostname
+      register: worker_hostname
+      changed_when: false
+
+    - name: Stop existing uptime client
+      shell: |
+        pkill -f 'run_client.*uptime' || true
+        screen -S uptime-client -X quit 2>/dev/null || true
+        screen -S uptime-rca -X quit 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Start RCA client in screen
+      shell: |
+        cd {{ uptime_dir }}
+        screen -dmS uptime-rca ./run_client_rca.sh {{ worker_hostname.stdout }}
+      args:
+        executable: /bin/bash
+
+    - name: Verify client is running
+      shell: screen -ls | grep uptime-rca
+      register: screen_check
+      changed_when: false
+      failed_when: screen_check.rc != 0
+
+    - name: Show client status
+      debug:
+        msg: "RCA client started for {{ worker_hostname.stdout }}"
+
+- name: Deploy RCA Server
+  hosts: uptime_server
+  become: yes
+  vars:
+    server_dir: /root/Telegram-Vast-Uptime-Bot
+    data_dir: /var/lib/uptime-monitor
+    admin_user: "{{ lookup('env', 'UPTIME_ADMIN_USER') | default('admin', true) }}"
+    admin_pass: "{{ lookup('env', 'UPTIME_ADMIN_PASS') }}"
+
+  tasks:
+    - name: Pull latest code from git
+      git:
+        repo: https://github.com/jjziets/Telegram-Vast-Uptime-Bot.git
+        dest: "{{ server_dir }}"
+        version: main
+        force: yes
+
+    - name: Create data directory
+      file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Update .env with admin credentials
+      lineinfile:
+        path: "{{ server_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+      loop:
+        - { key: "ADMIN_USER", value: "{{ admin_user }}" }
+        - { key: "ADMIN_PASS", value: "{{ admin_pass }}" }
+        - { key: "DATA_DIR", value: "{{ data_dir }}" }
+      when: admin_pass is defined and admin_pass != ""
+
+    - name: Stop existing server
+      shell: |
+        pkill -f 'server_rca.py' || true
+        screen -S uptime-server -X quit 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Start RCA server in screen
+      shell: |
+        cd {{ server_dir }}/lib
+        screen -dmS uptime-server bash -c 'source ../.env && python3 server_rca.py'
+      args:
+        executable: /bin/bash
+
+    - name: Verify server is running
+      shell: sleep 3 && curl -s http://localhost:5000/ | head -1
+      register: server_check
+      changed_when: false
+

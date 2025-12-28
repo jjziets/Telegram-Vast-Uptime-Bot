@@ -2,6 +2,13 @@
 
 Enhanced version with **Root Cause Analysis (RCA)** capabilities to diagnose network issues, DDoS, and server failures.
 
+## Security
+
+- **Public dashboard** (`/`) shows only "X systems monitored" - no details
+- **Admin dashboard** (`/admin`) requires authentication
+- **API endpoints** (`/admin/api/*`) require authentication
+- Set `ADMIN_USER` and `ADMIN_PASS` in `.env` to enable admin access
+
 ## New Features
 
 ### Client Side (`run_client_rca.sh`)
