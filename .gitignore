@@ -1,0 +1,29 @@
+# Environment files (contain secrets)
+.env
+.env.*
+!.env.example
+
+# Log files
+logs/
+*.log
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
