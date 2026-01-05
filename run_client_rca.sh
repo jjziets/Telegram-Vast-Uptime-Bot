@@ -1,8 +1,8 @@
 #!/bin/bash
-# Enhanced Uptime Client with RCA (Root Cause Analysis) Logging
-# - Collects MTR data on each ping
-# - Sends diagnostic backlog when recovering from failure
-# - Fixed traceroute/mtr parsing
+# Enhanced Uptime Client with Continuous MTR Logging
+# - Runs MTR with every ping and sends data to server
+# - Server can analyze hop latency history to identify problem hops
+# - On recovery, sends backlog of diagnostics
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 source $DIR/.env
@@ -10,14 +10,11 @@ source $DIR/.env
 WORKER=$1
 LOG_DIR="${DIR}/logs"
 METRICS_FILE="${LOG_DIR}/metrics.jsonl"
-DIAG_FILE="${LOG_DIR}/diagnostics.jsonl"
-MTR_DIR="${LOG_DIR}/mtr"
-BACKLOG_FILE="${LOG_DIR}/backlog.jsonl"
+MTR_FILE="${LOG_DIR}/mtr_history.jsonl"
 MAX_LOG_SIZE=$((50*1024*1024))  # 50MB max
-MAX_BACKLOG=10  # Keep last N diagnostic reports for backlog
 
 # Create directories
-mkdir -p "$LOG_DIR" "$MTR_DIR"
+mkdir -p "$LOG_DIR"
 
 # Colors
 RED='\033[0;31m'
@@ -28,7 +25,6 @@ NC='\033[0m'
 
 # State
 CONSECUTIVE_FAILURES=0
-LAST_STATUS="unknown"
 CWORKER=""
 
 if ! [ -n "$WORKER" ]; then
@@ -37,218 +33,145 @@ fi
 
 # Rotate log if too large
 rotate_logs() {
-    for f in "$METRICS_FILE" "$DIAG_FILE" "$BACKLOG_FILE"; do
-        if [ -f "$f" ] && [ $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]; then
-            mv "$f" "${f}.$(date +%Y%m%d_%H%M%S).old"
+    for f in "$METRICS_FILE" "$MTR_FILE"; do
+        if [ -f "$f" ]; then
+            local size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+            if [ "$size" -gt $MAX_LOG_SIZE ]; then
+                mv "$f" "${f}.$(date +%Y%m%d_%H%M%S).old"
+            fi
         fi
     done
-    # Clean old MTR files (keep last 100)
-    ls -t "$MTR_DIR"/*.json 2>/dev/null | tail -n +100 | xargs rm -f 2>/dev/null
 }
 
-# Log metric as JSON line
-log_metric() {
-    local status=$1
-    local http_code=$2
-    local latency=$3
-    local error=$4
-    
-    local ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    echo "{\"ts\":\"$ts\",\"worker\":\"$CWORKER\",\"status\":\"$status\",\"http\":\"$http_code\",\"latency_ms\":$latency,\"error\":\"$error\",\"consecutive_failures\":$CONSECUTIVE_FAILURES}" >> "$METRICS_FILE"
-}
-
-# Run MTR and return JSON
+# Run quick MTR and return JSON with hop data
 run_mtr() {
-    local target=$1
     local ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    local mtr_file="${MTR_DIR}/mtr_$(date +%Y%m%d_%H%M%S).json"
     
-    # Run MTR with JSON output if available, otherwise parse text
-    if mtr --version 2>&1 | grep -q "mtr"; then
-        # Try JSON output first (newer mtr)
-        local mtr_json=$(mtr -j -c 3 -w "$target" 2>/dev/null)
-        if [ -n "$mtr_json" ] && echo "$mtr_json" | grep -q "report"; then
-            echo "$mtr_json" > "$mtr_file"
-            echo "$mtr_json"
-            return
-        fi
+    # Run MTR with 3 pings, report mode
+    local mtr_raw=$(mtr -r -c 3 -n "$SERVER_ADDR" 2>/dev/null)
+    
+    if [ -z "$mtr_raw" ]; then
+        # Fallback to traceroute
+        mtr_raw=$(traceroute -n -m 15 -w 2 "$SERVER_ADDR" 2>/dev/null)
     fi
     
-    # Fallback: parse text MTR output
-    local mtr_text=$(mtr -r -c 3 -w "$target" 2>/dev/null || mtr -r -c 3 "$target" 2>/dev/null)
-    if [ -n "$mtr_text" ]; then
-        # Parse MTR text into JSON
-        local hops=$(echo "$mtr_text" | tail -n +2 | awk '{
-            gsub(/%/, "", $3);
-            printf "{\"hop\":%d,\"host\":\"%s\",\"loss\":%.1f,\"avg\":%.1f},", $1, $2, $3, $6
-        }' | sed 's/,$//')
-        
-        local result="{\"ts\":\"$ts\",\"target\":\"$target\",\"hops\":[$hops]}"
-        echo "$result" > "$mtr_file"
-        echo "$result"
+    if [ -z "$mtr_raw" ]; then
+        echo "{\"ts\":\"$ts\",\"error\":\"mtr/traceroute failed\"}"
         return
     fi
     
-    # Last resort: use traceroute
-    local tr_text=$(traceroute -n -m 15 -w 2 "$target" 2>/dev/null)
-    if [ -n "$tr_text" ]; then
-        local hops=$(echo "$tr_text" | tail -n +2 | awk '{
-            host = ($2 == "*") ? "timeout" : $2;
-            # Extract time from column that contains "ms"
-            time = -1;
-            for(i=3; i<=NF; i++) {
-                if($i ~ /^[0-9.]+$/ && $(i+1) == "ms") { time = $i; break; }
-            }
-            printf "{\"hop\":%d,\"host\":\"%s\",\"time\":%.1f},", $1, host, time
-        }' | sed 's/,$//')
-        
-        local result="{\"ts\":\"$ts\",\"target\":\"$target\",\"type\":\"traceroute\",\"hops\":[$hops]}"
-        echo "$result" > "$mtr_file"
-        echo "$result"
-        return
-    fi
+    # Parse MTR output into JSON array of hops
+    # Format: HOST Loss% Snt Last Avg Best Wrst StDev
+    local hops=$(echo "$mtr_raw" | tail -n +2 | awk '
+    BEGIN { printf "[" }
+    NR > 1 { printf "," }
+    {
+        # Handle MTR format: hop host loss% snt last avg best wrst stdev
+        gsub(/%/, "", $3)
+        host = $2
+        if (host == "???") host = "timeout"
+        loss = ($3 == "" || $3 == "???") ? 100 : $3
+        avg = ($6 == "" || $6 == "???") ? -1 : $6
+        last = ($5 == "" || $5 == "???") ? -1 : $5
+        printf "{\"hop\":%d,\"host\":\"%s\",\"loss\":%.1f,\"avg\":%.1f,\"last\":%.1f}", NR, host, loss+0, avg+0, last+0
+    }
+    END { printf "]" }
+    ')
     
-    echo "{\"ts\":\"$ts\",\"target\":\"$target\",\"error\":\"mtr/traceroute unavailable\"}"
+    # Also get final destination stats
+    local final_loss=$(echo "$mtr_raw" | tail -1 | awk '{gsub(/%/,"",$3); print $3+0}')
+    local final_avg=$(echo "$mtr_raw" | tail -1 | awk '{print $6+0}')
+    
+    echo "{\"ts\":\"$ts\",\"target\":\"$SERVER_ADDR\",\"loss\":${final_loss:-0},\"avg\":${final_avg:-0},\"hops\":$hops}"
 }
 
-# Run full network diagnostics
-run_diagnostics() {
-    local ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    echo -e "${CYAN}Running network diagnostics...${NC}"
-    
-    # Gateway check
-    local gateway=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -1)
-    local gw_loss=100
-    local gw_avg=-1
-    if [ -n "$gateway" ]; then
-        local gw_result=$(ping -c 3 -W 2 "$gateway" 2>&1)
-        gw_loss=$(echo "$gw_result" | grep -oP '\d+(?=% packet loss)' || echo "100")
-        gw_avg=$(echo "$gw_result" | grep -oP 'rtt [^=]*= [0-9.]+/\K[0-9.]+' || echo "-1")
+# Quick ping check (faster than MTR for normal operation)
+quick_check() {
+    local result=$(ping -c 1 -W 2 "$SERVER_ADDR" 2>&1)
+    if echo "$result" | grep -q "1 received"; then
+        local latency=$(echo "$result" | grep -oP 'time=\K[0-9.]+')
+        echo "${latency:-0}"
+        return 0
+    else
+        echo "-1"
+        return 1
     fi
-    
-    # External connectivity (8.8.8.8)
-    local ext_result=$(ping -c 3 -W 2 8.8.8.8 2>&1)
-    local ext_loss=$(echo "$ext_result" | grep -oP '\d+(?=% packet loss)' || echo "100")
-    local ext_avg=$(echo "$ext_result" | grep -oP 'rtt [^=]*= [0-9.]+/\K[0-9.]+' || echo "-1")
-    
-    # Bot server ping
-    local bot_result=$(ping -c 3 -W 3 "$SERVER_ADDR" 2>&1)
-    local bot_loss=$(echo "$bot_result" | grep -oP '\d+(?=% packet loss)' || echo "100")
-    local bot_avg=$(echo "$bot_result" | grep -oP 'rtt [^=]*= [0-9.]+/\K[0-9.]+' || echo "-1")
-    
-    # DNS check
-    local dns_start=$(date +%s%3N)
-    local dns_ok=0
-    if host "$SERVER_ADDR" >/dev/null 2>&1 || getent hosts "$SERVER_ADDR" >/dev/null 2>&1; then
-        dns_ok=1
-    fi
-    local dns_end=$(date +%s%3N)
-    local dns_ms=$((dns_end - dns_start))
-    
-    # TCP port check
-    local tcp_ok=0
-    if timeout 3 bash -c "echo '' > /dev/tcp/$SERVER_ADDR/$SERVER_PORT" 2>/dev/null; then
-        tcp_ok=1
-    fi
-    
-    # Run MTR to bot server
-    local mtr_data=$(run_mtr "$SERVER_ADDR")
-    
-    # Build diagnostics JSON
-    local diag=$(cat <<EOF
-{"ts":"$ts","worker":"$CWORKER","gateway":"${gateway:-none}","gw_loss_pct":$gw_loss,"gw_avg_ms":${gw_avg:--1},"external_loss_pct":$ext_loss,"external_avg_ms":${ext_avg:--1},"bot_loss_pct":$bot_loss,"bot_avg_ms":${bot_avg:--1},"dns_ok":$dns_ok,"dns_ms":$dns_ms,"tcp_port_ok":$tcp_ok,"mtr":$mtr_data}
-EOF
-)
-    
-    # Log diagnostics
-    echo "$diag" >> "$DIAG_FILE"
-    
-    # Add to backlog (for sending on recovery)
-    echo "$diag" >> "$BACKLOG_FILE"
-    # Trim backlog to last N entries
-    tail -n $MAX_BACKLOG "$BACKLOG_FILE" > "${BACKLOG_FILE}.tmp" && mv "${BACKLOG_FILE}.tmp" "$BACKLOG_FILE"
-    
-    # Analyze and print likely cause
-    echo -e "${CYAN}Diagnostics: gw=$gw_loss% ext=$ext_loss% bot=$bot_loss% tcp=$tcp_ok${NC}"
-    
-    if [ "$gw_loss" = "100" ]; then
-        echo -e "${RED}>>> CAUSE: Local gateway/network DOWN <<<${NC}"
-    elif [ "$ext_loss" = "100" ]; then
-        echo -e "${RED}>>> CAUSE: ISP/Upstream connectivity FAILED <<<${NC}"
-    elif [ "$bot_loss" = "100" ] && [ "$tcp_ok" = "0" ]; then
-        echo -e "${RED}>>> CAUSE: Bot server unreachable <<<${NC}"
-    elif [ "$bot_loss" = "100" ] && [ "$tcp_ok" = "1" ]; then
-        echo -e "${YELLOW}>>> CAUSE: ICMP blocked but TCP OK (DDoS mitigation?) <<<${NC}"
-    elif [ "$bot_loss" -gt 50 ] 2>/dev/null; then
-        echo -e "${YELLOW}>>> CAUSE: High packet loss (${bot_loss}%) <<<${NC}"
-    fi
-    
-    echo "$diag"
 }
 
-# Send backlog to server on recovery
-send_backlog() {
-    if [ ! -f "$BACKLOG_FILE" ]; then
-        return
-    fi
-    
-    echo -e "${CYAN}Sending diagnostic backlog to server...${NC}"
-    
-    # Read backlog and send as JSON array
-    local backlog_json=$(cat "$BACKLOG_FILE" | jq -s '.' 2>/dev/null)
-    if [ -z "$backlog_json" ] || [ "$backlog_json" = "null" ]; then
-        # jq not available, send as-is
-        backlog_json="[$(cat "$BACKLOG_FILE" | tr '\n' ',' | sed 's/,$//' )]"
-    fi
-    
-    # POST to server
-    local request_url="http://${SERVER_ADDR}:${SERVER_PORT}/ping/${CWORKER}?api_key=${API_KEY}"
-    curl -s -X POST -H "Content-Type: application/json" \
-        -d "{\"backlog\":$backlog_json,\"recovery\":true}" \
-        "$request_url" >/dev/null 2>&1
-    
-    # Clear backlog after sending
-    > "$BACKLOG_FILE"
-}
-
-# Main ping function
+# Main ping function with MTR data
 do_ping() {
+    local ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
     # Check nvidia-smi
     local driver_check=$(nvidia-smi 2>&1 | grep "Driver Version:")
     if [ $? -eq 0 ]; then
         local numGPUs=$(nvidia-smi --query-gpu=count --format=csv,noheader -i 0 2>/dev/null)
         CWORKER="${WORKER}(${numGPUs})"
     else
-        echo -e "${RED}$(date '+%H:%M:%S') - nvidia-smi failed${NC}"
         CWORKER="${WORKER}(GPU_ERR)"
-        log_metric "gpu_error" "0" "0" "nvidia-smi failed"
-        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-        return 1
     fi
     
-    local request_url="http://${SERVER_ADDR}:${SERVER_PORT}/ping/${CWORKER}?api_key=${API_KEY}"
-    local time_str=$(date "+%H:%M:%S-%d/%m/%Y")
+    local time_str=$(date "+%H:%M:%S")
     
-    # Capture timing
+    # Run MTR in background while we ping
+    local mtr_data=""
+    
+    # Every 5th ping or on failure, run full MTR
+    if [ $((RANDOM % 5)) -eq 0 ] || [ $CONSECUTIVE_FAILURES -gt 0 ]; then
+        mtr_data=$(run_mtr)
+    else
+        # Quick ping check for latency
+        local ping_latency=$(quick_check)
+        mtr_data="{\"ts\":\"$ts\",\"target\":\"$SERVER_ADDR\",\"quick_ping_ms\":$ping_latency}"
+    fi
+    
+    # Build request URL
+    local request_url="http://${SERVER_ADDR}:${SERVER_PORT}/ping/${CWORKER}?api_key=${API_KEY}"
+    
+    # Send ping with MTR data
     local start_ms=$(date +%s%3N)
-    local response=$(curl -m ${FAIL_TIMEOUT:-30} -s -o /dev/null -w "%{http_code}" "$request_url" 2>&1)
+    local response=$(curl -m ${FAIL_TIMEOUT:-30} -s -w "\n%{http_code}" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d "$mtr_data" \
+        "$request_url" 2>&1)
     local curl_exit=$?
     local end_ms=$(date +%s%3N)
     local latency=$((end_ms - start_ms))
     
-    if [ $curl_exit -eq 0 ] && [ "$response" = "200" ]; then
-        # Success - check if recovering from failure
+    # Parse response
+    local http_code=$(echo "$response" | tail -1)
+    local body=$(echo "$response" | head -n -1)
+    
+    # Log MTR data locally
+    echo "$mtr_data" >> "$MTR_FILE"
+    
+    if [ $curl_exit -eq 0 ] && [ "$http_code" = "200" ]; then
+        # Success
         if [ $CONSECUTIVE_FAILURES -gt 0 ]; then
-            echo -e "${GREEN}$time_str - RECOVERED${NC} after $CONSECUTIVE_FAILURES failures"
-            # Send backlog with diagnostics
-            send_backlog
+            echo -e "${GREEN}$time_str - RECOVERED${NC} after $CONSECUTIVE_FAILURES failures | ${latency}ms"
         else
-            echo -e "${GREEN}$time_str - OK${NC} | $CWORKER | ${latency}ms"
+            # Extract hop info for display
+            local hop_info=""
+            if echo "$mtr_data" | grep -q '"hops"'; then
+                local worst_hop=$(echo "$mtr_data" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    hops = d.get('hops', [])
+    worst = max(hops, key=lambda h: h.get('loss', 0)) if hops else None
+    if worst and worst.get('loss', 0) > 0:
+        print(f\"hop{worst['hop']}:{worst['loss']:.0f}%\")
+except: pass
+" 2>/dev/null)
+                [ -n "$worst_hop" ] && hop_info=" | $worst_hop"
+            fi
+            echo -e "${GREEN}$time_str - OK${NC} | ${latency}ms$hop_info"
         fi
-        
         CONSECUTIVE_FAILURES=0
-        LAST_STATUS="ok"
-        log_metric "ok" "$response" "$latency" ""
+        
+        # Log success
+        echo "{\"ts\":\"$ts\",\"worker\":\"$CWORKER\",\"status\":\"ok\",\"latency_ms\":$latency}" >> "$METRICS_FILE"
         return 0
     else
         # Failure
@@ -262,19 +185,28 @@ do_ping() {
             *)  error_msg="curl_error_$curl_exit" ;;
         esac
         
-        echo -e "${RED}$time_str - FAIL${NC} | Error: $error_msg | HTTP: $response | Consecutive: $CONSECUTIVE_FAILURES"
-        log_metric "fail" "$response" "$latency" "$error_msg"
-        LAST_STATUS="fail"
-        
-        # Run diagnostics on 2nd failure and then every 5th
-        if [ $CONSECUTIVE_FAILURES -eq 2 ] || [ $((CONSECUTIVE_FAILURES % 5)) -eq 0 ]; then
-            run_diagnostics >/dev/null
+        # Get problem hop from MTR if available
+        local problem_hop=""
+        if echo "$mtr_data" | grep -q '"hops"'; then
+            problem_hop=$(echo "$mtr_data" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    hops = d.get('hops', [])
+    # Find first hop with >50% loss or timeout
+    for h in hops:
+        if h.get('loss', 0) > 50 or h.get('host') == 'timeout':
+            print(f\"Problem at hop {h['hop']}: {h['host']} ({h.get('loss',0):.0f}% loss)\")
+            break
+except: pass
+" 2>/dev/null)
         fi
         
-        # Warning on extended outage
-        if [ $CONSECUTIVE_FAILURES -eq 6 ]; then
-            echo -e "${RED}!!! EXTENDED OUTAGE: Will be marked DOWN !!!${NC}"
-        fi
+        echo -e "${RED}$time_str - FAIL${NC} | $error_msg | HTTP:$http_code | Consecutive:$CONSECUTIVE_FAILURES"
+        [ -n "$problem_hop" ] && echo -e "${YELLOW}  → $problem_hop${NC}"
+        
+        # Log failure with MTR data
+        echo "{\"ts\":\"$ts\",\"worker\":\"$CWORKER\",\"status\":\"fail\",\"error\":\"$error_msg\",\"consecutive\":$CONSECUTIVE_FAILURES,\"mtr\":$mtr_data}" >> "$METRICS_FILE"
         
         return 1
     fi
@@ -282,19 +214,31 @@ do_ping() {
 
 # Startup
 echo "=========================================="
-echo "Enhanced Uptime Client with RCA Logging"
+echo "Uptime Client with MTR Logging"
 echo "=========================================="
 echo "Worker: $WORKER"
 echo "Server: ${SERVER_ADDR}:${SERVER_PORT}"
-echo "Ping Interval: ${PING_INTERVAL}s"
-echo "Fail Timeout: ${FAIL_TIMEOUT}s"
+echo "Ping Interval: ${PING_INTERVAL:-30}s"
 echo "Logs: $LOG_DIR"
 echo "=========================================="
 
-# Initial diagnostics
-echo "Running initial network check..."
-run_diagnostics >/dev/null
-echo "Initial check complete. Starting monitoring..."
+# Initial MTR test
+echo "Running initial MTR to $SERVER_ADDR..."
+initial_mtr=$(run_mtr)
+echo "$initial_mtr" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    hops = d.get('hops', [])
+    print(f'Traced {len(hops)} hops, final loss: {d.get(\"loss\", \"?\"):.1f}%, avg: {d.get(\"avg\", \"?\"):.1f}ms')
+    for h in hops:
+        status = '✓' if h.get('loss', 0) == 0 else '✗' if h.get('loss', 0) > 50 else '~'
+        print(f'  {status} Hop {h[\"hop\"]}: {h[\"host\"]} - {h.get(\"avg\", -1):.1f}ms ({h.get(\"loss\", 0):.0f}% loss)')
+except Exception as e:
+    print(f'MTR parse error: {e}')
+" 2>/dev/null
+echo "=========================================="
+echo "Starting monitoring..."
 
 # Main loop
 while true; do

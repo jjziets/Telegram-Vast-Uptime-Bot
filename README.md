@@ -1,255 +1,183 @@
-# Uptime Monitor with RCA (Root Cause Analysis)
+# Telegram Vast Uptime Bot - Enhanced with MTR Logging
 
-Monitor your GPU machines and get Telegram notifications when they go down. Now with **RCA capabilities** to diagnose whether issues are caused by network problems, DDoS, or individual server failures.
+A Telegram bot that monitors worker/server uptime with **continuous MTR/traceroute logging** for root cause analysis.
 
 ## Features
 
-- 🔔 **Telegram Notifications** - Instant alerts when machines go up/down
-- 🔒 **Secure Dashboard** - Public page hides details, admin requires login
-- 📊 **RCA Analysis** - Detects mass failures (network issue) vs individual failures
-- 📡 **MTR Logging** - Captures traceroute data on failures for investigation
-- 📋 **Event History** - Stores all events for retrospective analysis
-- 🔄 **Backlog on Recovery** - Sends diagnostics when connection recovers
+- ✅ Telegram notifications when workers go up/down
+- ✅ **Continuous MTR logging** - Every ping includes hop data
+- ✅ **Problem hop detection** - Shows which network hop is causing issues
+- ✅ **Fleet outage detection** - Identifies when multiple workers from same IP go down
+- ✅ Admin dashboard with authentication for viewing hop history
+- ✅ Historical event and hop data storage for RCA
 
-![Dashboard](https://github.com/jjziets/Telegram-Vast-Uptime-Bot/assets/19214485/a3de851e-738c-49cd-852c-bb702e7800f2)
+## How It Works
+
+### Client Side
+The client runs MTR to the server periodically and sends hop data with each ping:
+- Every 5th ping: Full MTR trace (all hops with loss/latency)
+- Other pings: Quick latency check
+- On failure: Full MTR + detailed diagnostics
+
+### Server Side
+The server stores hop data and analyzes patterns:
+- When a worker goes DOWN, it checks the hop history to identify the problem hop
+- Telegram notifications include the specific hop causing issues
+- Admin dashboard shows historical hop data for any worker
+
+### Example Notification
+
+```
+🔴 brickbox-5(3) is DOWN
+📍 Hop 7 (196.60.8.129) showing 78% loss
+⚠️ NETWORK ISSUE: 12 workers from 88.0.33.1 went down
+```
 
 ## Quick Start
 
-### 1. Setup Telegram Bot
+### Server Setup
 
-1. Search for **BotFather** in Telegram
-2. Send `/newbot` and follow the prompts
-3. Copy the token it gives you
-4. Create a group chat, add your bot, and send `/start`
-
-### 2. Server Setup (VPS)
-
-A $2.50-$3.50 server from [Vultr](https://www.vultr.com/?ref=8581277-6G) works great ($100 credit with referral).
-
+1. Clone the repo:
 ```bash
-# Install dependencies
-sudo apt update && sudo apt install -y git python3 python3-pip
-
-# Clone repository
 git clone https://github.com/jjziets/Telegram-Vast-Uptime-Bot.git
 cd Telegram-Vast-Uptime-Bot
-pip install -r requirements.txt
+```
 
-# Create data directory for RCA
-sudo mkdir -p /var/lib/uptime-monitor
-
-# Create .env file
-cat > .env << 'EOF'
-CHAT_ID=-123456789          # Your Telegram chat ID (see below)
-TELEGRAM_TOKEN=your_token   # From BotFather
-API_KEY=your_secret_key     # Random string for client auth
-SERVER_ADDR=your_server_ip  # Your VPS IP
+2. Create `.env`:
+```bash
+TELEGRAM_TOKEN=your_bot_token
+CHAT_ID=your_chat_id
+API_KEY=your_secret_api_key
 SERVER_PORT=5000
-FAIL_TIMEOUT=180            # Seconds before marking as down
-PING_INTERVAL=30            # Client ping interval
-
-# RCA Admin (optional but recommended)
+FAIL_TIMEOUT=180
 ADMIN_USER=admin
 ADMIN_PASS=your_secure_password
-DATA_DIR=/var/lib/uptime-monitor
-EOF
+DATA_DIR=/var/lib/uptime-bot
 ```
 
-#### Get Chat ID
-After adding your bot token to `.env`:
+3. Start the server:
 ```bash
-./run_server.sh chat_id
+screen -dmS uptime-server bash -c "source .env && python3 lib/server_rca.py"
 ```
 
-Or for groups: Check URL in Telegram Web - use `-XXXXXXXXX` format (add `-100` prefix for private channels).
+### Client Setup
 
-#### Start Server
-
-**Basic server** (original):
+1. Copy client files to your worker:
 ```bash
-./run_server.sh
+scp run_client_rca.sh .env user@worker:/opt/uptime-client/
 ```
 
-**RCA server** (recommended - with diagnostics):
+2. Create `.env` on client:
 ```bash
-cd lib && python3 server_rca.py
-```
-
-**Auto-start on boot:**
-```bash
-# For RCA server:
-(crontab -l; echo "@reboot screen -dmS uptime-rca bash -c 'cd /root/Telegram-Vast-Uptime-Bot && source .env && cd lib && python3 server_rca.py'") | crontab -
-```
-
-### 3. Client Setup (GPU Machines)
-
-```bash
-# Clone repository
-git clone https://github.com/jjziets/Telegram-Vast-Uptime-Bot.git
-cd Telegram-Vast-Uptime-Bot
-
-# Create .env (only needs these)
-cat > .env << 'EOF'
-API_KEY=your_secret_key     # Same as server
-SERVER_ADDR=your_server_ip  # Your VPS IP
+SERVER_ADDR=your-server-ip
 SERVER_PORT=5000
+API_KEY=your_secret_api_key
 PING_INTERVAL=30
-FAIL_TIMEOUT=30             # Curl timeout
-EOF
-
-# Install mtr for diagnostics (RCA client only)
-sudo apt install -y mtr curl jq
+FAIL_TIMEOUT=30
 ```
 
-#### Start Client
-
-**Basic client:**
+3. Start the client:
 ```bash
-./run_client.sh $(hostname)
+screen -dmS uptime-client ./run_client_rca.sh my-worker-name
 ```
 
-**RCA client** (recommended - with diagnostics):
+4. Add to crontab for boot:
 ```bash
-./run_client_rca.sh $(hostname)
+@reboot screen -dmS uptime-client /opt/uptime-client/run_client_rca.sh my-worker
 ```
 
-**Auto-start on boot:**
-```bash
-# For RCA client:
-(crontab -l; echo "@reboot screen -dmS uptime-rca /root/Telegram-Vast-Uptime-Bot/run_client_rca.sh \$(hostname)") | crontab -
-```
+## Admin Dashboard
 
-## Dashboards & API
+Access the dashboard at `http://your-server:5000/admin` (requires authentication).
 
-### Public Dashboard
-`http://your-server:5000/` - Shows only "X systems monitored" (safe to expose)
+Features:
+- View all online workers and their hop history
+- See recent events (UP/DOWN)
+- Analyze hop data for any worker
+- Identify problem hops across the fleet
 
-### Admin Dashboard  
-`http://your-server:5000/admin` - Full details (requires login)
+## API Endpoints
 
-### RCA API Endpoints
-All require authentication (`-u admin:password`):
+### Public
+- `GET /` - Basic status
+- `POST /ping/<worker_id>?api_key=xxx` - Worker ping with hop data
 
-```bash
-# Current status with all workers
-curl -u admin:pass http://server:5000/admin/api/status
+### Authenticated (Basic Auth)
+- `GET /admin` - Dashboard
+- `GET /api/status` - Detailed status
+- `GET /api/worker/<id>` - Worker details + recent hops
+- `GET /api/hops/<id>` - Full hop history
+- `GET /api/events?limit=N` - Recent events
+- `GET /api/rca/<id>` - Root cause analysis for a worker
 
-# Recent events (up/down)
-curl -u admin:pass "http://server:5000/admin/api/events?limit=50"
+## Understanding the Hop Data
 
-# Failure analysis (is it network issue or individual?)
-curl -u admin:pass http://server:5000/admin/api/analysis
+When a worker goes down, check the hop data to identify the problem:
 
-# Full RCA report
-curl -u admin:pass http://server:5000/admin/api/rca
+| Hop | Host | Loss | Meaning |
+|-----|------|------|---------|
+| 1 | 192.168.1.1 | 0% | Local gateway - OK |
+| 2 | ISP-router | 0% | ISP edge - OK |
+| 7 | **196.60.8.1** | **78%** | **Problem hop!** |
+| 8+ | ??? | 100% | Blocked by hop 7 |
 
-# Specific worker with MTR data
-curl -u admin:pass http://server:5000/admin/api/worker/brickbox-43(4)
+Common patterns:
+- **Hop 1-2 high loss**: Local network issue
+- **Mid-path hop high loss**: ISP/transit issue  
+- **Final hop high loss**: Server issue
+- **All hops 100% loss**: Complete network outage
 
-# All client diagnostics
-curl -u admin:pass http://server:5000/admin/api/diagnostics
-```
+## Ansible Deployment
 
-## RCA: Investigating Outages
-
-When you get down/up notifications, the RCA features help determine the cause:
-
-### Automatic Detection
-
-The server analyzes failure patterns:
-- **5+ workers down from same IP** → Network/ISP issue
-- **5+ workers down from different IPs** → Possible DDoS
-- **1-2 workers down** → Individual server issue
-
-Telegram notifications include this context:
-```
-🔴 brickbox-43(4) is DOWN
-⚠️ NETWORK ISSUE: 5 workers from same IP went down
-```
-
-### Client Diagnostics
-
-The RCA client (`run_client_rca.sh`) captures on each failure:
-- Gateway connectivity
-- External connectivity (8.8.8.8)
-- Bot server ping + packet loss
-- Full MTR/traceroute
-- DNS resolution time
-- TCP port check
-
-Logs stored in `logs/` directory:
-- `metrics.jsonl` - All ping attempts
-- `diagnostics.jsonl` - Network diagnostics on failures
-- `mtr/` - Individual MTR captures
-
-### Offline Analysis
+For deploying to multiple workers, see `ansible/` directory:
 
 ```bash
-# Copy logs from a client
-scp user@gpu-machine:/path/logs/*.jsonl ./
-
-# Analyze
-python3 analyze_rca.py metrics.jsonl diagnostics.jsonl
-```
-
-## Ansible Deployment (Multiple Machines)
-
-For deploying to many machines at once:
-
-```bash
-# On your control machine (e.g., bbmaint)
-cd ansible/
-
-# Copy and edit inventory
+cd ansible
 cp inventory.example.ini inventory.ini
-# Edit with your machine IPs
-
-# Deploy clients to all machines
+# Edit inventory.ini with your hosts
 ansible-playbook -i inventory.ini deploy_rca_client.yml
 ```
 
-## Configuration Reference
+## Files
 
-### Server `.env`
-```bash
-CHAT_ID=-123456789          # Telegram chat/group ID
-TELEGRAM_TOKEN=xxx          # Bot token from BotFather
-API_KEY=secret              # Shared secret with clients
-SERVER_PORT=5000            # Listen port
-FAIL_TIMEOUT=180            # Seconds before DOWN notification
-ADMIN_USER=admin            # Admin login (RCA server)
-ADMIN_PASS=password         # Admin password (RCA server)
-DATA_DIR=/var/lib/uptime-monitor  # Where to store events
-```
+- `lib/server_rca.py` - Enhanced server with MTR storage
+- `run_client_rca.sh` - Enhanced client with MTR logging
+- `ansible/` - Deployment automation
+- `logs/` - Local log directory (client-side)
 
-### Client `.env`
-```bash
-API_KEY=secret              # Same as server
-SERVER_ADDR=1.2.3.4         # Server IP/hostname
-SERVER_PORT=5000            # Server port
-PING_INTERVAL=30            # Seconds between pings
-FAIL_TIMEOUT=30             # Curl timeout
-```
+## Environment Variables
+
+### Server
+| Variable | Description | Default |
+|----------|-------------|---------|
+| TELEGRAM_TOKEN | Bot token from @BotFather | required |
+| CHAT_ID | Telegram chat ID | required |
+| API_KEY | Shared secret for API auth | required |
+| SERVER_PORT | HTTP port | 5000 |
+| FAIL_TIMEOUT | Seconds before worker marked DOWN | 180 |
+| ADMIN_USER | Dashboard username | admin |
+| ADMIN_PASS | Dashboard password | admin |
+| DATA_DIR | Directory for data files | /var/lib/uptime-bot |
+
+### Client
+| Variable | Description | Default |
+|----------|-------------|---------|
+| SERVER_ADDR | Server hostname/IP | required |
+| SERVER_PORT | Server port | 5000 |
+| API_KEY | Shared secret | required |
+| PING_INTERVAL | Seconds between pings | 30 |
 
 ## Troubleshooting
 
-**Too many false notifications?**
-- Increase `FAIL_TIMEOUT` on server (e.g., 300 for 5 minutes)
+### Client shows "mtr/traceroute failed"
+Install mtr: `apt install mtr-tiny` or use fallback traceroute.
 
-**Client not sending pings?**
-- Check `nvidia-smi` works (client needs GPU count)
-- Check network connectivity to server
+### High CPU on client
+MTR runs every 5th ping. Increase `PING_INTERVAL` if needed.
 
-**Admin login not working?**
-- Ensure `ADMIN_PASS` is set in `.env`
-- Use RCA server (`server_rca.py`), not basic server
+### No hop data in notifications
+Ensure client is using `run_client_rca.sh`, not the old `run_client.sh`.
 
-**View server logs:**
-```bash
-screen -r uptime-rca
-# Or check: /tmp/rca_server.log
-```
+## License
 
-## Credits
-
-Based on [leona/vast.ai-tools](https://github.com/leona/vast.ai-tools)
+MIT

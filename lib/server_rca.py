@@ -1,75 +1,50 @@
 #!/usr/bin/env python3
 """
-Enhanced Uptime Server with RCA (Root Cause Analysis) Support
-- Stores all events to JSON file for historical analysis
-- Detects patterns (mass failures = network issue)
-- Provides API endpoints for querying event history
-- Authentication for sensitive endpoints
-- Receives MTR/diagnostic data from clients
+Enhanced Uptime Bot Server with MTR/Hop Logging
+- Receives hop data with each ping from clients
+- Stores historical hop data for RCA analysis
+- When workers go down, shows which hop is the problem
 """
 
-from flask import jsonify, request, Flask, render_template, Response
-from functools import wraps
-from queue import Queue
-import threading
-from threading import Timer, Event
 import os
-import time
 import json
-import hashlib
-import secrets
+import threading
 from datetime import datetime, timedelta
-from pathlib import Path
-from utilities import telegram_request
+from functools import wraps
+from flask import Flask, jsonify, request, render_template_string, Response
+from queue import Queue
+from collections import defaultdict
+import requests
+import time
 
 app = Flask(__name__)
 
 # Configuration
 FAIL_TIMEOUT = int(os.getenv("FAIL_TIMEOUT", 180))
-DATA_DIR = Path(os.getenv("DATA_DIR", "/var/lib/uptime-monitor"))
-EVENTS_FILE = DATA_DIR / "events.jsonl"
-DIAGNOSTICS_FILE = DATA_DIR / "diagnostics.jsonl"
-MAX_EVENTS_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+DATA_DIR = os.getenv("DATA_DIR", "/var/lib/uptime-bot")
+MAX_HOP_HISTORY = 1000  # Keep last N hop records per worker
 
-# Authentication - set via environment or generate random
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "")  # Must be set in production!
-API_KEY = os.getenv("API_KEY", "")
+# Storage
+worker_timers = {}          # worker_id -> threading.Timer
+worker_last_seen = {}       # worker_id -> datetime
+worker_ip = {}              # worker_id -> source IP
+worker_hop_history = defaultdict(list)  # worker_id -> [{ts, hops, loss, avg}]
+event_log = []              # [{ts, type, worker, data}]
+message_queue = Queue()
+data_lock = threading.Lock()
 
 # Ensure data directory exists
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Core data structures
-timers = {}
-pause_events = {}
-last_seen = {}
-worker_diagnostics = {}  # Store latest diagnostics per worker
-message_queue = Queue()
-
-# In-memory event cache (last 1000 events)
-event_cache = []
-MAX_CACHE_SIZE = 1000
-
-
-# ============ Authentication ============
+# === Authentication ===
 
 def check_auth(username, password):
-    """Check if username/password is valid"""
-    if not ADMIN_PASS:
-        return False  # No password set = deny all
-    return username == ADMIN_USER and password == ADMIN_PASS
-
+    return username == os.getenv("ADMIN_USER", "admin") and password == os.getenv("ADMIN_PASS", "admin")
 
 def authenticate():
-    """Send 401 response for authentication"""
-    return Response(
-        'Authentication required.\n'
-        'Please login with proper credentials.', 401,
-        {'WWW-Authenticate': 'Basic realm="Uptime Monitor Admin"'})
-
+    return Response('Authentication required', 401, {'WWW-Authenticate': 'Basic realm="Admin"'})
 
 def requires_auth(f):
-    """Decorator for routes that require authentication"""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
@@ -78,464 +53,518 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
+# === Event Logging ===
 
-def requires_api_key(f):
-    """Decorator for API routes that need API key"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        key = request.args.get('api_key') or request.headers.get('X-API-Key')
-        if key != API_KEY:
-            return jsonify({"error": "Invalid API key"}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-
-# ============ Event Logging ============
-
-def rotate_file(filepath):
-    """Rotate file if too large"""
-    if filepath.exists() and filepath.stat().st_size > MAX_EVENTS_FILE_SIZE:
-        backup = filepath.with_suffix(f".{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
-        filepath.rename(backup)
-
-
-def log_event(event_type, worker, client_ip=None, extra=None):
-    """Log event to file and cache"""
-    event = {
-        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "type": event_type,
-        "worker": worker,
-        "client_ip": client_ip,
-        **(extra or {})
-    }
-    
-    try:
-        rotate_file(EVENTS_FILE)
-        with open(EVENTS_FILE, "a") as f:
-            f.write(json.dumps(event) + "\n")
-    except Exception as e:
-        print(f"Error writing event: {e}")
-    
-    event_cache.append(event)
-    if len(event_cache) > MAX_CACHE_SIZE:
-        event_cache.pop(0)
-    
-    return event
-
-
-def log_diagnostics(worker, client_ip, diag_data):
-    """Log diagnostics data from client"""
-    record = {
-        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "worker": worker,
-        "client_ip": client_ip,
-        **diag_data
-    }
-    
-    try:
-        rotate_file(DIAGNOSTICS_FILE)
-        with open(DIAGNOSTICS_FILE, "a") as f:
-            f.write(json.dumps(record) + "\n")
-    except Exception as e:
-        print(f"Error writing diagnostics: {e}")
-    
-    # Store latest diagnostics per worker
-    worker_diagnostics[worker] = record
-    
-    return record
-
-
-def get_recent_events(limit=100, event_type=None, worker=None, since_minutes=None):
-    """Get recent events from cache"""
-    events = event_cache[-limit*2:]
-    
-    if since_minutes:
-        cutoff = datetime.utcnow() - timedelta(minutes=since_minutes)
-        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-        events = [e for e in events if e["ts"] >= cutoff_str]
-    
-    if event_type:
-        events = [e for e in events if e["type"] == event_type]
-    
-    if worker:
-        events = [e for e in events if e["worker"] == worker]
-    
-    return events[-limit:]
-
-
-def analyze_failures():
-    """Analyze recent failures to determine root cause pattern"""
-    recent_downs = get_recent_events(limit=100, event_type="down", since_minutes=5)
-    
-    if not recent_downs:
-        return {
-            "status": "healthy",
-            "message": "No recent failures",
-            "affected_workers": [],
-            "likely_cause": None
+def log_event(event_type, worker_id, data=None):
+    """Log an event for historical analysis"""
+    with data_lock:
+        event = {
+            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "type": event_type,
+            "worker": worker_id,
+            "ip": worker_ip.get(worker_id),
+            "data": data or {}
         }
-    
-    workers = list(set(e["worker"] for e in recent_downs))
-    ips = list(set(e.get("client_ip", "unknown") for e in recent_downs))
-    
-    if len(workers) >= 5:
-        if len(ips) == 1:
-            return {
-                "status": "network_issue",
-                "severity": "high",
-                "message": f"NETWORK ISSUE: {len(workers)} workers from same IP went down",
-                "affected_workers": workers,
-                "likely_cause": "ISP/upstream connectivity issue or local network problem"
-            }
-        elif len(ips) <= 2:
-            return {
-                "status": "network_issue",
-                "severity": "high", 
-                "message": f"REGIONAL ISSUE: {len(workers)} workers from {len(ips)} locations down",
-                "affected_workers": workers,
-                "likely_cause": "Regional network or upstream provider issue"
-            }
-        else:
-            return {
-                "status": "possible_ddos",
-                "severity": "critical",
-                "message": f"POSSIBLE DDOS: {len(workers)} workers from {len(ips)} IPs down",
-                "affected_workers": workers,
-                "likely_cause": "DDoS attack on bot server or widespread outage"
-            }
-    elif len(workers) >= 2:
-        return {
-            "status": "partial_outage",
-            "severity": "medium",
-            "message": f"PARTIAL: {len(workers)} workers down recently",
-            "affected_workers": workers,
-            "likely_cause": "Localized network issue or coincidental failures"
-        }
-    else:
-        return {
-            "status": "individual_failure",
-            "severity": "low",
-            "message": f"Individual failure: {workers[0]}",
-            "affected_workers": workers,
-            "likely_cause": "Individual server issue (reboot, GPU crash, etc.)"
-        }
-
-
-def message_sender():
-    """Background thread to send Telegram messages with rate limiting"""
-    while True:
-        message = message_queue.get()
+        event_log.append(event)
+        
+        # Trim log if too large
+        if len(event_log) > 10000:
+            event_log[:] = event_log[-5000:]
+        
+        # Persist to file
         try:
-            while True:
-                response = telegram_request("/sendMessage?chat_id=" + os.getenv("CHAT_ID") + "&text=" + message)
-                if response.get('error_code') == 429:
-                    retry_after = response.get('parameters', {}).get('retry_after', 1)
-                    time.sleep(retry_after)
-                else:
-                    break
+            with open(os.path.join(DATA_DIR, "events.jsonl"), "a") as f:
+                f.write(json.dumps(event) + "\n")
         except Exception as e:
-            print(f"Error sending message: {e}")
-        finally:
-            message_queue.task_done()
+            print(f"Error writing event: {e}")
 
+def store_hop_data(worker_id, hop_data):
+    """Store hop data for a worker"""
+    with data_lock:
+        worker_hop_history[worker_id].append(hop_data)
+        # Trim old data
+        if len(worker_hop_history[worker_id]) > MAX_HOP_HISTORY:
+            worker_hop_history[worker_id] = worker_hop_history[worker_id][-MAX_HOP_HISTORY:]
+    
+    # Persist to file
+    try:
+        with open(os.path.join(DATA_DIR, "hops.jsonl"), "a") as f:
+            f.write(json.dumps({"worker": worker_id, **hop_data}) + "\n")
+    except Exception as e:
+        print(f"Error writing hop data: {e}")
 
-threading.Thread(target=message_sender, daemon=True).start()
+def find_problem_hop(hop_data):
+    """Analyze hop data to find the problem hop"""
+    hops = hop_data.get("hops", [])
+    if not hops:
+        return None
+    
+    # Find first hop with significant loss
+    for hop in hops:
+        if hop.get("loss", 0) > 50 or hop.get("host") == "timeout":
+            return hop
+    
+    # Find hop with highest loss
+    worst = max(hops, key=lambda h: h.get("loss", 0), default=None)
+    if worst and worst.get("loss", 0) > 10:
+        return worst
+    
+    return None
 
+def get_last_hop_data(worker_id, count=5):
+    """Get recent hop data for a worker"""
+    with data_lock:
+        return worker_hop_history.get(worker_id, [])[-count:]
+
+def analyze_worker_outage(worker_id):
+    """Analyze why a worker might be down based on hop history"""
+    recent = get_last_hop_data(worker_id, 10)
+    if not recent:
+        return {"status": "no_data", "message": "No hop data available"}
+    
+    # Find problem hops across recent data
+    problem_hops = []
+    for data in recent:
+        problem = find_problem_hop(data)
+        if problem:
+            problem_hops.append(problem)
+    
+    if not problem_hops:
+        return {"status": "unknown", "message": "No obvious network issue detected"}
+    
+    # Count which hop appears most often as problem
+    hop_counts = defaultdict(int)
+    hop_info = {}
+    for h in problem_hops:
+        hop_counts[h["hop"]] += 1
+        hop_info[h["hop"]] = h
+    
+    most_common = max(hop_counts.items(), key=lambda x: x[1])
+    problem = hop_info[most_common[0]]
+    
+    return {
+        "status": "problem_identified",
+        "hop_number": problem["hop"],
+        "hop_host": problem.get("host", "unknown"),
+        "loss_pct": problem.get("loss", 0),
+        "frequency": f"{most_common[1]}/{len(recent)}",
+        "message": f"Hop {problem['hop']} ({problem.get('host', '?')}) showing {problem.get('loss', 0):.0f}% loss"
+    }
+
+def analyze_fleet_outage():
+    """Analyze if multiple workers from same IP are down"""
+    with data_lock:
+        # Find workers that recently went down
+        recent_downs = [e for e in event_log[-100:] if e["type"] == "down"]
+        if len(recent_downs) < 3:
+            return None
+        
+        # Check if from same IP in last 60 seconds
+        cutoff = datetime.utcnow() - timedelta(seconds=60)
+        recent = [e for e in recent_downs 
+                  if datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ") > cutoff]
+        
+        # Group by IP
+        by_ip = defaultdict(list)
+        for e in recent:
+            ip = e.get("ip")
+            if ip:
+                by_ip[ip].append(e["worker"])
+        
+        # Find IP with most downs
+        if by_ip:
+            worst_ip = max(by_ip.items(), key=lambda x: len(x[1]))
+            if len(worst_ip[1]) >= 3:
+                return {
+                    "ip": worst_ip[0],
+                    "workers": worst_ip[1],
+                    "count": len(worst_ip[1]),
+                    "message": f"NETWORK ISSUE: {len(worst_ip[1])} workers from {worst_ip[0]} went down"
+                }
+    return None
+
+# === Timer/Notification Logic ===
 
 def missed_ping(worker):
-    """Called when a worker misses its ping timeout"""
-    pause_event = pause_events.get(worker)
-    if pause_event is not None:
-        pause_event.wait()
+    """Called when a worker misses its ping deadline"""
+    with data_lock:
+        current_time = datetime.now()
+        last_ping = worker_last_seen.get(worker)
+        
+        if last_ping and (current_time - last_ping) > timedelta(seconds=FAIL_TIMEOUT):
+            print(f"[{current_time}] Worker {worker} DOWN")
+            
+            # Analyze why
+            outage_info = analyze_worker_outage(worker)
+            fleet_info = analyze_fleet_outage()
+            
+            # Build message
+            msg = f"🔴 {worker} is DOWN"
+            
+            # Add hop info if available
+            if outage_info["status"] == "problem_identified":
+                msg += f"\n📍 {outage_info['message']}"
+            
+            # Add fleet info if multiple down
+            if fleet_info:
+                msg += f"\n⚠️ {fleet_info['message']}"
+            
+            # Log event with full details
+            log_event("down", worker, {
+                "last_seen": last_ping.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "outage_analysis": outage_info,
+                "fleet_analysis": fleet_info
+            })
+            
+            message_queue.put(msg)
+            
+            # Remove from tracking
+            del worker_timers[worker]
 
-    current_time = datetime.now()
-    last_ping = last_seen.get(worker, current_time)
+def restart_timer(worker):
+    """Restart the timeout timer for a worker"""
+    if worker in worker_timers:
+        worker_timers[worker].cancel()
     
-    if (current_time - last_ping) > timedelta(seconds=FAIL_TIMEOUT):
-        print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] DOWN: {worker}")
-        
-        log_event("down", worker, extra={
-            "last_seen": last_ping.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "seconds_since_ping": (current_time - last_ping).total_seconds()
-        })
-        
-        analysis = analyze_failures()
-        
-        msg = f"🔴 {worker} is DOWN"
-        if analysis["status"] in ["network_issue", "possible_ddos"]:
-            msg += f"\n⚠️ {analysis['message']}"
-        
-        message_queue.put(msg)
-    else:
-        print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] False alarm: {worker}")
+    timer = threading.Timer(FAIL_TIMEOUT, missed_ping, [worker])
+    timer.start()
+    worker_timers[worker] = timer
 
-    if worker in timers:
-        del timers[worker]
-    if worker in pause_events:
-        del pause_events[worker]
+# === Telegram Thread ===
 
+def telegram_sender():
+    """Background thread that sends Telegram messages"""
+    chat_id = os.getenv("CHAT_ID")
+    token = os.getenv("TELEGRAM_TOKEN")
+    
+    if not chat_id or not token:
+        print("WARNING: Telegram credentials not configured!")
+        return
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
+    while True:
+        try:
+            msg = message_queue.get()
+            print(f"Sending Telegram: {msg}")
+            
+            resp = requests.post(url, json={
+                "chat_id": chat_id,
+                "text": msg,
+                "parse_mode": "Markdown"
+            }, timeout=10)
+            
+            if not resp.ok:
+                print(f"Telegram error: {resp.text}")
+        except Exception as e:
+            print(f"Telegram send error: {e}")
 
-# ============ Public Endpoints (no auth) ============
+# Start telegram thread
+telegram_thread = threading.Thread(target=telegram_sender, daemon=True)
+telegram_thread.start()
+
+# === API Routes ===
 
 @app.route('/ping/<worker_id>', methods=['GET', 'POST'])
 def ping(worker_id):
-    """Receive heartbeat ping from worker (protected by API key only)"""
+    """Handle ping from worker - accepts hop data in POST body"""
+    # Verify API key
     api_key = request.args.get('api_key')
+    if api_key != os.getenv("API_KEY"):
+        return jsonify({"error": "Invalid API key"}), 403
+    
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-
-    if api_key != API_KEY:
-        print(f"Invalid API key for {worker_id} from {client_ip}")
-        return jsonify({"status": 0, "msg": "Invalid API key"})
-
-    current_time = datetime.now()
-    last_seen[worker_id] = current_time
-    worker_was_new = worker_id not in timers
-
-    # Cancel existing timer
-    if worker_id in timers:
-        timers[worker_id].cancel()
-
-    # Create new timer
-    pause_event = Event()
-    pause_event.set()
-    pause_events[worker_id] = pause_event
-    timers[worker_id] = Timer(FAIL_TIMEOUT, missed_ping, [worker_id])
-    timers[worker_id].daemon = True
-    timers[worker_id].start()
-
-    # Handle POST with diagnostics data
-    if request.method == 'POST' and request.is_json:
-        diag_data = request.get_json()
-        if diag_data:
-            log_diagnostics(worker_id, client_ip, diag_data)
-            print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Received diagnostics from {worker_id}")
-
-    if worker_was_new:
-        print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] UP: {worker_id} from {client_ip}")
-        log_event("up", worker_id, client_ip)
+    client_ip = client_ip.split(',')[0].strip() if client_ip else request.remote_addr
+    
+    # Parse hop data from POST body
+    hop_data = {}
+    if request.method == 'POST':
+        try:
+            hop_data = request.get_json(silent=True) or {}
+        except:
+            pass
+    
+    with data_lock:
+        is_new = worker_id not in worker_timers
+        worker_last_seen[worker_id] = datetime.now()
+        worker_ip[worker_id] = client_ip
+    
+    # Store hop data
+    if hop_data:
+        hop_data["client_ip"] = client_ip
+        store_hop_data(worker_id, hop_data)
+    
+    # Send UP notification if new
+    if is_new:
+        log_event("up", worker_id, {"ip": client_ip})
         message_queue.put(f"🟢 {worker_id} is UP")
-
-    return jsonify({"status": 1, "msg": "Heartbeat received"})
-
+        print(f"[{datetime.now()}] Worker {worker_id} UP from {client_ip}")
+    
+    restart_timer(worker_id)
+    
+    return jsonify({
+        "status": "ok",
+        "worker": worker_id,
+        "fail_timeout": FAIL_TIMEOUT
+    })
 
 @app.route('/')
 def index():
-    """Public dashboard - shows only basic info"""
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    active_workers = sorted(list(timers.keys()))
-    # Public view: just count, no names
-    return f"""<!DOCTYPE html>
+    """Simple status page"""
+    with data_lock:
+        workers = list(worker_timers.keys())
+        status = {w: worker_last_seen.get(w, datetime.min).strftime("%Y-%m-%d %H:%M:%S") 
+                  for w in workers}
+    
+    return jsonify({
+        "status": "running",
+        "workers_online": len(workers),
+        "fail_timeout": FAIL_TIMEOUT,
+        "workers": status
+    })
+
+@app.route('/api/status')
+def api_status():
+    """Detailed status API"""
+    with data_lock:
+        workers = []
+        now = datetime.now()
+        for w, timer in worker_timers.items():
+            last = worker_last_seen.get(w, datetime.min)
+            hop_history = worker_hop_history.get(w, [])
+            last_hop = hop_history[-1] if hop_history else None
+            
+            workers.append({
+                "id": w,
+                "ip": worker_ip.get(w),
+                "last_seen": last.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "seconds_ago": (now - last).total_seconds(),
+                "hop_records": len(hop_history),
+                "last_hop": last_hop
+            })
+        
+        return jsonify({
+            "online": len(workers),
+            "fail_timeout": FAIL_TIMEOUT,
+            "workers": sorted(workers, key=lambda x: x["id"])
+        })
+
+@app.route('/api/worker/<worker_id>')
+def api_worker(worker_id):
+    """Get details for a specific worker including hop history"""
+    with data_lock:
+        if worker_id not in worker_timers:
+            return jsonify({"error": "Worker not found"}), 404
+        
+        last = worker_last_seen.get(worker_id, datetime.min)
+        hop_history = worker_hop_history.get(worker_id, [])
+        
+        return jsonify({
+            "id": worker_id,
+            "ip": worker_ip.get(worker_id),
+            "last_seen": last.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "hop_records": len(hop_history),
+            "recent_hops": hop_history[-20:]  # Last 20 entries
+        })
+
+@app.route('/api/hops/<worker_id>')
+@requires_auth
+def api_hops(worker_id):
+    """Get full hop history for analysis (protected)"""
+    with data_lock:
+        hop_history = worker_hop_history.get(worker_id, [])
+        return jsonify({
+            "worker": worker_id,
+            "count": len(hop_history),
+            "hops": hop_history
+        })
+
+@app.route('/api/events')
+@requires_auth
+def api_events():
+    """Get recent events (protected)"""
+    limit = request.args.get('limit', 100, type=int)
+    event_type = request.args.get('type')
+    
+    with data_lock:
+        events = event_log[-limit:]
+        if event_type:
+            events = [e for e in events if e["type"] == event_type]
+    
+    return jsonify({"events": events})
+
+@app.route('/api/rca/<worker_id>')
+@requires_auth
+def api_rca(worker_id):
+    """Get RCA analysis for a worker (protected)"""
+    analysis = analyze_worker_outage(worker_id)
+    recent_hops = get_last_hop_data(worker_id, 10)
+    
+    # Find consistent problem hops
+    hop_issues = defaultdict(list)
+    for data in recent_hops:
+        for hop in data.get("hops", []):
+            if hop.get("loss", 0) > 0:
+                hop_issues[hop["hop"]].append({
+                    "ts": data.get("ts"),
+                    "host": hop.get("host"),
+                    "loss": hop.get("loss"),
+                    "avg": hop.get("avg")
+                })
+    
+    return jsonify({
+        "worker": worker_id,
+        "analysis": analysis,
+        "hop_issues": dict(hop_issues),
+        "recent_data_count": len(recent_hops)
+    })
+
+# === Admin Dashboard ===
+
+ADMIN_TEMPLATE = """
+<!DOCTYPE html>
 <html>
-<head><title>Uptime Monitor</title>
-<meta http-equiv="refresh" content="30">
-<style>
-body {{ font-family: sans-serif; max-width: 600px; margin: 50px auto; text-align: center; }}
-.status {{ font-size: 48px; margin: 30px; }}
-.healthy {{ color: green; }}
-.warning {{ color: orange; }}
-.count {{ font-size: 24px; color: #666; }}
-</style>
+<head>
+    <title>Uptime Bot - RCA Dashboard</title>
+    <style>
+        body { font-family: 'JetBrains Mono', monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        h1, h2 { color: #58a6ff; }
+        .worker { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; margin: 10px 0; }
+        .online { border-left: 4px solid #3fb950; }
+        .hop-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        .hop-table th, .hop-table td { padding: 8px; text-align: left; border-bottom: 1px solid #30363d; }
+        .loss-high { color: #f85149; }
+        .loss-med { color: #d29922; }
+        .loss-ok { color: #3fb950; }
+        .event { padding: 5px 10px; margin: 5px 0; border-radius: 4px; }
+        .event-up { background: #238636; }
+        .event-down { background: #da3633; }
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+        .tab { padding: 10px 20px; background: #21262d; border-radius: 6px; cursor: pointer; }
+        .tab.active { background: #388bfd; }
+        .panel { display: none; }
+        .panel.active { display: block; }
+        pre { background: #161b22; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    </style>
 </head>
 <body>
-<h1>🖥️ Uptime Monitor</h1>
-<div class="status healthy">✅ Operational</div>
-<div class="count">{len(active_workers)} systems monitored</div>
-<p style="color:#999">Last check: {current_time}</p>
-<p><a href="/admin">Admin Login</a></p>
+    <h1>🔍 Uptime Bot - RCA Dashboard</h1>
+    
+    <div class="tabs">
+        <div class="tab active" onclick="showPanel('status')">Status</div>
+        <div class="tab" onclick="showPanel('hops')">Hop Data</div>
+        <div class="tab" onclick="showPanel('events')">Events</div>
+    </div>
+    
+    <div id="status" class="panel active">
+        <h2>Workers Online: <span id="count">-</span></h2>
+        <div id="workers"></div>
+    </div>
+    
+    <div id="hops" class="panel">
+        <h2>Recent Hop Data</h2>
+        <select id="worker-select" onchange="loadWorkerHops()"></select>
+        <div id="hop-data"></div>
+    </div>
+    
+    <div id="events" class="panel">
+        <h2>Recent Events</h2>
+        <div id="event-list"></div>
+    </div>
+    
+    <script>
+        function showPanel(name) {
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById(name).classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        function lossClass(loss) {
+            if (loss > 50) return 'loss-high';
+            if (loss > 10) return 'loss-med';
+            return 'loss-ok';
+        }
+        
+        async function loadStatus() {
+            const resp = await fetch('/api/status');
+            const data = await resp.json();
+            document.getElementById('count').textContent = data.online;
+            
+            const select = document.getElementById('worker-select');
+            select.innerHTML = data.workers.map(w => `<option value="${w.id}">${w.id}</option>`).join('');
+            
+            document.getElementById('workers').innerHTML = data.workers.map(w => `
+                <div class="worker online">
+                    <strong>${w.id}</strong> (${w.ip})
+                    <br>Last seen: ${w.seconds_ago.toFixed(0)}s ago
+                    <br>Hop records: ${w.hop_records}
+                    ${w.last_hop ? `<br>Last hop data: ${JSON.stringify(w.last_hop.loss || 'N/A')}% loss` : ''}
+                </div>
+            `).join('');
+        }
+        
+        async function loadWorkerHops() {
+            const worker = document.getElementById('worker-select').value;
+            if (!worker) return;
+            
+            const resp = await fetch(`/api/worker/${worker}`);
+            const data = await resp.json();
+            
+            let html = `<h3>${worker} - ${data.hop_records} records</h3>`;
+            if (data.recent_hops && data.recent_hops.length > 0) {
+                for (const entry of data.recent_hops.slice(-5).reverse()) {
+                    html += `<div style="margin: 10px 0"><strong>${entry.ts}</strong>`;
+                    if (entry.hops) {
+                        html += '<table class="hop-table"><tr><th>Hop</th><th>Host</th><th>Loss</th><th>Avg</th></tr>';
+                        for (const h of entry.hops) {
+                            html += `<tr>
+                                <td>${h.hop}</td>
+                                <td>${h.host}</td>
+                                <td class="${lossClass(h.loss)}">${h.loss}%</td>
+                                <td>${h.avg}ms</td>
+                            </tr>`;
+                        }
+                        html += '</table>';
+                    }
+                    html += '</div>';
+                }
+            }
+            document.getElementById('hop-data').innerHTML = html;
+        }
+        
+        async function loadEvents() {
+            const resp = await fetch('/api/events?limit=50');
+            const data = await resp.json();
+            
+            document.getElementById('event-list').innerHTML = data.events.reverse().map(e => `
+                <div class="event event-${e.type}">
+                    ${e.ts} - <strong>${e.worker}</strong> ${e.type.toUpperCase()}
+                    ${e.ip ? `(${e.ip})` : ''}
+                    ${e.data?.outage_analysis?.message ? `<br>→ ${e.data.outage_analysis.message}` : ''}
+                </div>
+            `).join('');
+        }
+        
+        loadStatus();
+        loadEvents();
+        setInterval(loadStatus, 10000);
+        setInterval(loadEvents, 30000);
+    </script>
 </body>
-</html>"""
-
-
-# ============ Protected Admin Endpoints ============
+</html>
+"""
 
 @app.route('/admin')
 @requires_auth
 def admin_dashboard():
-    """Protected admin dashboard with full details"""
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    active_workers = sorted(list(timers.keys()))
-    analysis = analyze_failures()
-    recent = get_recent_events(limit=20)
-    
-    workers_html = "\n".join(f"<li>{w}</li>" for w in active_workers)
-    events_html = "\n".join(
-        f"<tr><td>{e['ts']}</td><td>{'🟢' if e['type']=='up' else '🔴'} {e['type']}</td><td>{e['worker']}</td></tr>"
-        for e in reversed(recent)
-    )
-    
-    return f"""<!DOCTYPE html>
-<html>
-<head><title>Uptime Monitor - Admin</title>
-<meta http-equiv="refresh" content="30">
-<style>
-body {{ font-family: sans-serif; max-width: 1200px; margin: 20px auto; padding: 0 20px; }}
-.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-.card {{ background: #f5f5f5; padding: 20px; border-radius: 8px; }}
-.status-healthy {{ color: green; }}
-.status-warning {{ color: orange; }}
-.status-danger {{ color: red; }}
-table {{ width: 100%; border-collapse: collapse; }}
-td, th {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
-ul {{ columns: 3; }}
-</style>
-</head>
-<body>
-<h1>🖥️ Uptime Monitor - Admin</h1>
-<p>Last refresh: {current_time}</p>
+    return render_template_string(ADMIN_TEMPLATE)
 
-<div class="card">
-<h2>System Health</h2>
-<p class="status-{analysis['status']}">{analysis['message']}</p>
-{f"<p>Likely cause: {analysis['likely_cause']}</p>" if analysis.get('likely_cause') else ""}
-</div>
-
-<div class="grid">
-<div class="card">
-<h2>Active Workers ({len(active_workers)})</h2>
-<ul>{workers_html}</ul>
-</div>
-
-<div class="card">
-<h2>Recent Events</h2>
-<table>
-<tr><th>Time</th><th>Type</th><th>Worker</th></tr>
-{events_html}
-</table>
-</div>
-</div>
-
-<p><a href="/admin/api/rca">Full RCA Report (JSON)</a> | 
-<a href="/admin/api/diagnostics">Diagnostics Data</a></p>
-</body>
-</html>"""
-
-
-@app.route('/admin/api/status')
-@requires_auth
-def admin_api_status():
-    """Protected API: Current system status"""
-    active = sorted(list(timers.keys()))
-    analysis = analyze_failures()
-    
-    return jsonify({
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "active_workers": len(active),
-        "workers": active,
-        "health": analysis
-    })
-
-
-@app.route('/admin/api/events')
-@requires_auth
-def admin_api_events():
-    """Protected API: Query event history"""
-    limit = request.args.get('limit', 100, type=int)
-    event_type = request.args.get('type')
-    worker = request.args.get('worker')
-    since = request.args.get('since_minutes', type=int)
-    
-    events = get_recent_events(
-        limit=min(limit, 1000),
-        event_type=event_type,
-        worker=worker,
-        since_minutes=since
-    )
-    
-    return jsonify({"count": len(events), "events": events})
-
-
-@app.route('/admin/api/analysis')
-@requires_auth
-def admin_api_analysis():
-    """Protected API: Get failure analysis"""
-    return jsonify(analyze_failures())
-
-
-@app.route('/admin/api/worker/<worker_id>')
-@requires_auth
-def admin_api_worker(worker_id):
-    """Protected API: Get worker status and diagnostics"""
-    is_up = worker_id in timers
-    last = last_seen.get(worker_id)
-    events = get_recent_events(limit=20, worker=worker_id)
-    diag = worker_diagnostics.get(worker_id)
-    
-    return jsonify({
-        "worker": worker_id,
-        "status": "up" if is_up else "down",
-        "last_seen": last.strftime("%Y-%m-%dT%H:%M:%SZ") if last else None,
-        "recent_events": events,
-        "last_diagnostics": diag
-    })
-
-
-@app.route('/admin/api/rca')
-@requires_auth
-def admin_api_rca():
-    """Protected API: Detailed RCA report"""
-    events = get_recent_events(limit=500, since_minutes=60)
-    
-    up_count = len([e for e in events if e["type"] == "up"])
-    down_count = len([e for e in events if e["type"] == "down"])
-    
-    down_events = [e for e in events if e["type"] == "down"]
-    time_buckets = {}
-    for e in down_events:
-        bucket = e["ts"][:15] + "0:00Z"
-        if bucket not in time_buckets:
-            time_buckets[bucket] = []
-        time_buckets[bucket].append(e["worker"])
-    
-    mass_failures = [
-        {"time": k, "workers": v, "count": len(v)}
-        for k, v in time_buckets.items() if len(v) >= 3
-    ]
-    
-    return jsonify({
-        "period": "last_60_minutes",
-        "total_events": len(events),
-        "up_events": up_count,
-        "down_events": down_count,
-        "mass_failure_windows": mass_failures,
-        "current_analysis": analyze_failures()
-    })
-
-
-@app.route('/admin/api/diagnostics')
-@requires_auth  
-def admin_api_diagnostics():
-    """Protected API: Get all worker diagnostics"""
-    return jsonify({
-        "count": len(worker_diagnostics),
-        "diagnostics": worker_diagnostics
-    })
-
-
-# ============ Startup ============
-
-def load_event_cache():
-    """Load recent events from file into memory cache"""
-    if EVENTS_FILE.exists():
-        try:
-            with open(EVENTS_FILE, "r") as f:
-                lines = f.readlines()[-MAX_CACHE_SIZE:]
-                for line in lines:
-                    try:
-                        event_cache.append(json.loads(line.strip()))
-                    except:
-                        pass
-            print(f"Loaded {len(event_cache)} events into cache")
-        except Exception as e:
-            print(f"Error loading event cache: {e}")
-
+# === Main ===
 
 if __name__ == '__main__':
-    print(f"Enhanced Uptime Monitor with RCA Support")
-    print(f"FAIL_TIMEOUT: {FAIL_TIMEOUT}s")
-    print(f"Data directory: {DATA_DIR}")
-    print(f"Admin user: {ADMIN_USER}")
-    print(f"Admin password: {'SET' if ADMIN_PASS else 'NOT SET - admin disabled!'}")
+    print(f"Starting Uptime Bot Server with RCA")
+    print(f"  FAIL_TIMEOUT: {FAIL_TIMEOUT}s")
+    print(f"  DATA_DIR: {DATA_DIR}")
     
-    load_event_cache()
-    
-    app.run(host="0.0.0.0", port=int(os.getenv("SERVER_PORT", 5000)))
+    app.run(host='0.0.0.0', port=int(os.getenv("SERVER_PORT", 5000)))
